@@ -108,6 +108,32 @@ class ITranslation:
         return repr(self).replace("->", "→")
 
 
+    def translate_batch(self, input_texts: list[str]) -> list[str]:
+        """Translates multiple strings from self.from_lang to self.to_lang
+
+        Args:
+            input_texts: List of texts to be translated.
+
+        Returns:
+            List of translated texts in the same order.
+        """
+        hypotheses_list = self.hypotheses_batch(input_texts, num_hypotheses=1)
+        return [hyp[0].value for hyp in hypotheses_list]
+
+    def hypotheses_batch(self, input_texts: list[str], num_hypotheses: int = 4) -> list[list[Hypothesis]]:
+        """Default implementation that processes texts one by one.
+        Subclasses should override this for better batch processing.
+        
+        Args:
+            input_texts: List of texts to be translated.
+            num_hypotheses: Number of hypotheses to generate per text.
+            
+        Returns:
+            List of hypothesis lists, one list per input text.
+        """
+        return [self.hypotheses(text, num_hypotheses) for text in input_texts]
+
+
 class Language:
     """Represents a language that can be translated from/to.
 
@@ -206,6 +232,79 @@ class PackageTranslation(ITranslation):
         info("hypotheses_to_return:", hypotheses_to_return)
         return hypotheses_to_return
 
+    def hypotheses_batch(self, input_texts: list[str], num_hypotheses: int = 4) -> list[list[Hypothesis]]:
+        if self.translator is None:
+            model_path = str(self.pkg.package_path / "model")
+            self.translator = ctranslate2.Translator(
+                model_path,
+                device=settings.device,
+                inter_threads=settings.inter_threads,
+                intra_threads=settings.intra_threads,
+            )
+
+        # Split all texts into sentences
+        all_paragraphs = [ITranslation.split_into_paragraphs(text) for text in input_texts]
+        
+        # Flatten all sentences into a single batch
+        all_sentences = []
+        sentence_map = []  # Keep track of which sentences belong to which text/paragraph
+        
+        for text_idx, paragraphs in enumerate(all_paragraphs):
+            for para_idx, paragraph in enumerate(paragraphs):
+                sentences = self.sentencizer.split_sentences(paragraph)
+                all_sentences.extend(sentences)
+                sentence_map.extend([(text_idx, para_idx) for _ in sentences])
+
+        # Tokenize all sentences at once
+        tokenized = [self.pkg.tokenizer.encode(sentence) for sentence in all_sentences]
+        
+        # Prepare target prefix if needed
+        target_prefix = None
+        if self.pkg.target_prefix != "":
+            target_prefix = [[self.pkg.target_prefix]] * len(tokenized)
+
+        # Translate all sentences in one batch
+        translated_batches = self.translator.translate_batch(
+            tokenized,
+            target_prefix=target_prefix,
+            replace_unknowns=True,
+            max_batch_size=32,  # You might want to make this configurable
+            beam_size=max(num_hypotheses, 4),
+            num_hypotheses=num_hypotheses,
+            length_penalty=0.2,
+            return_scores=True,
+        )
+
+        # Reorganize results back into original text structure
+        results = [[] for _ in input_texts]
+        current_hypotheses = [[] for _ in input_texts]
+        
+        for batch_idx, (text_idx, para_idx) in enumerate(sentence_map):
+            translated_batch = translated_batches[batch_idx]
+            
+            # Process each hypothesis for this sentence
+            for hyp_idx in range(num_hypotheses):
+                tokens = translated_batch.hypotheses[hyp_idx]
+                score = translated_batch.scores[hyp_idx]
+                
+                # Decode and clean up the translation
+                value = self.pkg.tokenizer.decode(tokens)
+                if self.pkg.target_prefix != "" and value.startswith(self.pkg.target_prefix):
+                    value = value[len(self.pkg.target_prefix):]
+                if len(value) > 0 and value[0] == " ":
+                    value = value[1:]
+                
+                # Add to the appropriate hypothesis
+                if len(current_hypotheses[text_idx]) <= hyp_idx:
+                    current_hypotheses[text_idx].append(Hypothesis("", 0))
+                
+                current_hyp = current_hypotheses[text_idx][hyp_idx]
+                current_hyp.value = ITranslation.combine_paragraphs(
+                    [current_hyp.value, value]
+                ).lstrip("\n")
+                current_hyp.score += score
+
+        return current_hypotheses
 
 class IdentityTranslation(ITranslation):
     """A Translation that doesn't modify input_text."""
@@ -330,6 +429,59 @@ class CachedTranslation(ITranslation):
                 hypotheses_to_return[i] = Hypothesis(value, score)
             hypotheses_to_return[i].value = hypotheses_to_return[i].value.lstrip("\n")
         return hypotheses_to_return
+
+    def hypotheses_batch(self, input_texts: list[str], num_hypotheses: int = 4) -> list[list[Hypothesis]]:
+        new_cache = dict()  # 'text': ['t1'...('tN')]
+
+        paragraphs_ls = [ITranslation.split_into_paragraphs(input_text) for input_text in input_texts]
+
+        translated_paragraphs_d = {}
+        paragraphs_to_translate = []
+        for paragraphs in paragraphs_ls:
+            for paragraph in paragraphs:
+                translated_paragraph = self.cache.get(paragraph)
+                if translated_paragraph:
+                    translated_paragraphs_d[paragraph] = translated_paragraph
+                else:
+                    translated_paragraphs_d[paragraph] = ""
+                    paragraphs_to_translate.append(paragraph)
+
+        translated_paragraphs_p = self.underlying.hypotheses_batch(
+                    paragraphs_to_translate, num_hypotheses
+                )
+        for o_paragraph, paragraph in zip(paragraphs_to_translate, translated_paragraphs_p):
+            translated_paragraphs_d[o_paragraph] = paragraph
+
+        translated_paragraphs_ls = []
+        for paragraphs in paragraphs_ls:
+            translated_paragraphs = []
+            for paragraph in paragraphs:
+                translated_paragraphs.append(translated_paragraphs_d[paragraph])
+                new_cache[paragraph] = translated_paragraph
+            translated_paragraphs_ls.append(translated_paragraphs)
+
+        self.cache = new_cache
+
+        # Construct hypotheses
+
+        hypotheses_to_return_ls = []
+
+        for translated_paragraphs in translated_paragraphs_ls:
+            hypotheses_to_return = [Hypothesis("", 0) for i in range(num_hypotheses)]
+            for i in range(num_hypotheses):
+                for j in range(len(translated_paragraphs)):
+                    if not translated_paragraphs[j]:
+                        continue
+                    value = ITranslation.combine_paragraphs(
+                        [hypotheses_to_return[i].value, translated_paragraphs[j][i].value]
+                    )
+                    score = (
+                        hypotheses_to_return[i].score + translated_paragraphs[j][i].score
+                    )
+                    hypotheses_to_return[i] = Hypothesis(value, score)
+                hypotheses_to_return[i].value = hypotheses_to_return[i].value.lstrip("\n")
+            hypotheses_to_return_ls.append(hypotheses_to_return)
+        return hypotheses_to_return_ls
 
 
 class RemoteTranslation(ITranslation):
@@ -696,7 +848,7 @@ def get_translation_from_codes(from_code: str, to_code: str) -> ITranslation:
     return from_lang.get_translation(to_lang)
 
 
-def translate(q: str, from_code: str, to_code: str) -> str:
+def translate(q: str | List[str], from_code: str, to_code: str) -> str:
     """Translate a string of text
 
     Args:
@@ -708,4 +860,9 @@ def translate(q: str, from_code: str, to_code: str) -> str:
         The translated text
     """
     translation = get_translation_from_codes(from_code, to_code)
-    return translation.translate(q)
+    if isinstance(q, str):
+        return translation.translate(q)
+    elif isinstance(q, list):
+        return translation.translate_batch(q)
+    else:
+        raise TypeError("Input must be a string or a list of strings")
