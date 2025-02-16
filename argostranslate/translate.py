@@ -3,13 +3,13 @@ from __future__ import annotations
 from typing import List
 
 import ctranslate2
-# import sentencepiece as spm
+import sentencepiece as spm
 from ctranslate2 import Translator
 
 from argostranslate import apis, fewshot, package, sbd, settings
 from argostranslate.models import ILanguageModel
 from argostranslate.package import Package
-from argostranslate.sbd import SpacySentencizerSmall, StanzaSentencizer
+from argostranslate.sbd import SpacySentencizerSmall
 from argostranslate.utils import info
 
 
@@ -67,7 +67,7 @@ class ITranslation:
 
         Args:
             input_text: The text to be translated.
-            num_hypotheses: Number of hypothetical results expected
+            num_hypotheses: Number of hypothetic results expected
 
         Returns:
             List of translation hypotheses
@@ -108,12 +108,50 @@ class ITranslation:
         return repr(self).replace("->", "→")
 
 
+    def translate_batch(self, input_texts: list[str]) -> list[str]:
+        """
+        Translate a list of texts from the source language to the target language.
+        
+        This method processes each input text in a batch by calling the 
+        `hypotheses_batch` method with `num_hypotheses` set to 1, thereby generating a single 
+        translation hypothesis per text. The first hypothesis's value is extracted for each input, 
+        and the translations are returned in the same order as the inputs.
+        
+        Parameters:
+            input_texts (list[str]): A list of text strings to be translated.
+        
+        Returns:
+            list[str]: A list of translated text strings corresponding to the input texts.
+        """
+        hypotheses_list = self.hypotheses_batch(input_texts, num_hypotheses=1)
+        return [hyp[0].value for hyp in hypotheses_list]
+
+    def hypotheses_batch(self, input_texts: list[str], num_hypotheses: int = 4) -> list[list[Hypothesis]]:
+        """
+        Generate translation hypotheses for a batch of input texts.
+        
+        This default implementation processes each text individually by calling
+        the `hypotheses` method for every string in the provided list. Subclasses
+        should override this method to implement optimized batch processing if needed.
+        
+        Args:
+            input_texts (list[str]): A list of texts to be translated.
+            num_hypotheses (int, optional): The number of hypotheses to generate for
+                each text. Defaults to 4.
+        
+        Returns:
+            list[list[Hypothesis]]: A list where each element is a list of `Hypothesis`
+                objects representing the translation hypotheses for the corresponding input text.
+        """
+        return [self.hypotheses(text, num_hypotheses) for text in input_texts]
+
+
 class Language:
     """Represents a language that can be translated from/to.
 
     Attributes:
         code: The code representing the language.
-        name: The human-readable name of the language.
+        name: The human readable name of the language.
         translations_from: A list of the translations
             that translate from this language.
         translations_to: A list of the translations
@@ -160,16 +198,25 @@ class PackageTranslation(ITranslation):
         self.to_lang = to_lang
         self.pkg = pkg
         self.translator = None
-        if 'stanza' in str(pkg.packaged_sbd_path):
-            self.sentencizer = StanzaSentencizer(pkg)
-        elif pkg.packaged_sbd_path is None or 'spacy' in str(pkg.packaged_sbd_path):
-            self.sentencizer = SpacySentencizerSmall(pkg)
-        else:
-            # Any other SBD dependency should be defined as a class in the SBD module.
-            raise NotImplementedError()
-
+        self.sentencizer = SpacySentencizerSmall()
 
     def hypotheses(self, input_text: str, num_hypotheses: int = 4) -> list[Hypothesis]:
+        """
+        Generate a list of translation hypotheses for the provided input text.
+        
+        This method produces multiple translation hypotheses by lazily initializing a translator (if not already set)
+        and processing the input text in segmented paragraphs. Each paragraph is translated separately using a packaged
+        translation function, and the outputs are combined sequentially to form final hypotheses. The combination involves
+        merging translation strings and summing their corresponding quality scores. Logging is performed at key steps to
+        assist with debugging and tracing the translation process.
+        
+        Parameters:
+            input_text (str): The text to be translated, potentially containing multiple paragraphs.
+            num_hypotheses (int, optional): The number of translation hypotheses to generate. Defaults to 4.
+        
+        Returns:
+            list[Hypothesis]: A list of Hypothesis objects, each encapsulating a combined translation and its cumulative score.
+        """
         if self.translator is None:
             model_path = str(self.pkg.package_path / "model")
             self.translator = ctranslate2.Translator(
@@ -187,8 +234,8 @@ class PackageTranslation(ITranslation):
                     self.pkg,
                     paragraph,
                     self.translator,
-                    self.sentencizer,
                     num_hypotheses,
+                    self.sentencizer,
                 )
             )
         info("translated_paragraphs:", translated_paragraphs)
@@ -206,6 +253,102 @@ class PackageTranslation(ITranslation):
         info("hypotheses_to_return:", hypotheses_to_return)
         return hypotheses_to_return
 
+    def hypotheses_batch(self, input_texts: list[str], num_hypotheses: int = 4) -> list[list[Hypothesis]]:
+        """
+        Generate batch translation hypotheses for multiple input texts.
+        
+        This method processes a list of texts by splitting each text into paragraphs and sentences, tokenizing the sentences, and then translating them in a single batch using the underlying ctranslate2 translator. The translations for each sentence are decoded, cleaned up by removing any specified target prefix, and then combined to form a coherent translation for the entire text. Each translated sentence contributes to an accumulated translation score for the respective hypothesis.
+        
+        Parameters:
+            input_texts (list[str]): List of texts to be translated.
+            num_hypotheses (int, optional): Number of translation hypotheses to generate per sentence. Defaults to 4.
+        
+        Returns:
+            list[list[Hypothesis]]: A list where each element corresponds to an input text and contains a list of Hypothesis objects. Each Hypothesis object includes a 'value' (the translated text) and a 'score' (the accumulated translation quality score).
+        
+        Notes:
+            - If the translator is not already initialized, it sets up a new ctranslate2.Translator using the model path from the package.
+            - The beam size is set to the maximum of num_hypotheses and 4 to ensure a minimum beam search depth.
+            - This method relies on a tokenizer (self.pkg.tokenizer) and a sentencizer (self.sentencizer) for processing the texts.
+            - Translations are performed in batch for efficiency, and results are reorganized to match the original text structure.
+        
+        Example:
+            >>> hypotheses = translator.hypotheses_batch(["Hello world.", "How are you?"], num_hypotheses=3)
+            >>> for hyp in hypotheses[0]:
+            ...     print(hyp.value, hyp.score)
+        """
+        if self.translator is None:
+            model_path = str(self.pkg.package_path / "model")
+            self.translator = ctranslate2.Translator(
+                model_path,
+                device=settings.device,
+                inter_threads=settings.inter_threads,
+                intra_threads=settings.intra_threads,
+            )
+
+        # Split all texts into sentences
+        all_paragraphs = [ITranslation.split_into_paragraphs(text) for text in input_texts]
+        
+        # Flatten all sentences into a single batch
+        all_sentences = []
+        sentence_map = []  # Keep track of which sentences belong to which text/paragraph
+        
+        for text_idx, paragraphs in enumerate(all_paragraphs):
+            for para_idx, paragraph in enumerate(paragraphs):
+                sentences = self.sentencizer.split_sentences(paragraph)
+                all_sentences.extend(sentences)
+                sentence_map.extend([(text_idx, para_idx) for _ in sentences])
+
+        # Tokenize all sentences at once
+        tokenized = [self.pkg.tokenizer.encode(sentence) for sentence in all_sentences]
+        
+        # Prepare target prefix if needed
+        target_prefix = None
+        if self.pkg.target_prefix != "":
+            target_prefix = [[self.pkg.target_prefix]] * len(tokenized)
+
+        # Translate all sentences in one batch
+        translated_batches = self.translator.translate_batch(
+            tokenized,
+            target_prefix=target_prefix,
+            replace_unknowns=True,
+            max_batch_size=32,  # You might want to make this configurable
+            beam_size=max(num_hypotheses, 4),
+            num_hypotheses=num_hypotheses,
+            length_penalty=0.2,
+            return_scores=True,
+        )
+
+        # Reorganize results back into original text structure
+        results = [[] for _ in input_texts]
+        current_hypotheses = [[] for _ in input_texts]
+        
+        for batch_idx, (text_idx, para_idx) in enumerate(sentence_map):
+            translated_batch = translated_batches[batch_idx]
+            
+            # Process each hypothesis for this sentence
+            for hyp_idx in range(num_hypotheses):
+                tokens = translated_batch.hypotheses[hyp_idx]
+                score = translated_batch.scores[hyp_idx]
+                
+                # Decode and clean up the translation
+                value = self.pkg.tokenizer.decode(tokens)
+                if self.pkg.target_prefix != "" and value.startswith(self.pkg.target_prefix):
+                    value = value[len(self.pkg.target_prefix):]
+                if len(value) > 0 and value[0] == " ":
+                    value = value[1:]
+                
+                # Add to the appropriate hypothesis
+                if len(current_hypotheses[text_idx]) <= hyp_idx:
+                    current_hypotheses[text_idx].append(Hypothesis("", 0))
+                
+                current_hyp = current_hypotheses[text_idx][hyp_idx]
+                current_hyp.value = ITranslation.combine_paragraphs(
+                    [current_hyp.value, value]
+                ).lstrip("\n")
+                current_hyp.score += score
+
+        return current_hypotheses
 
 class IdentityTranslation(ITranslation):
     """A Translation that doesn't modify input_text."""
@@ -299,12 +442,35 @@ class CachedTranslation(ITranslation):
         self.cache = dict()
 
     def hypotheses(self, input_text: str, num_hypotheses: int = 4) -> list[Hypothesis]:
+        """
+        Generate aggregated translation hypotheses for the given input text.
+        
+        This method splits the input text into paragraphs and retrieves translation hypotheses for each
+        paragraph using an internal cache. If a paragraph's cached hypotheses are missing or do not match
+        the requested number (`num_hypotheses`), the method re-generates them using the underlying translation
+        engine. It then combines the corresponding hypotheses from each paragraph by concatenating their
+        translation values (using `ITranslation.combine_paragraphs`) and summing their scores, resulting in a
+        set of aggregated hypotheses for the entire text. Any leading newline characters are removed from
+        the final translation values.
+        
+        Parameters:
+            input_text (str): The text to be translated, which may contain multiple paragraphs.
+            num_hypotheses (int, optional): The number of translation hypotheses to generate per paragraph.
+                Defaults to 4.
+        
+        Returns:
+            list[Hypothesis]: A list of aggregated Hypothesis objects for the entire input text, each containing
+            a combined translation value and an aggregated score.
+        
+        Side Effects:
+            Updates the internal cache (self.cache) with the latest paragraph hypotheses.
+        """
         new_cache = dict()  # 'text': ['t1'...('tN')]
         paragraphs = ITranslation.split_into_paragraphs(input_text)
         translated_paragraphs = []
         for paragraph in paragraphs:
             translated_paragraph = self.cache.get(paragraph)
-            # If len() of our cached items are different from `num_hypotheses` it means that
+            # If len() of our cached items are different than `num_hypotheses` it means that
             # the search parameter is changed by caller, so we can't re-use cache, and should update it.
             if (
                 translated_paragraph is None
@@ -330,6 +496,71 @@ class CachedTranslation(ITranslation):
                 hypotheses_to_return[i] = Hypothesis(value, score)
             hypotheses_to_return[i].value = hypotheses_to_return[i].value.lstrip("\n")
         return hypotheses_to_return
+
+    def hypotheses_batch(self, input_texts: list[str], num_hypotheses: int = 4) -> list[list[Hypothesis]]:
+        """
+        Generate a batch of translation hypotheses for multiple input texts using caching and an underlying translator.
+        
+        This method processes each input text by splitting it into paragraphs, then checks an internal cache to reuse previously translated paragraphs. For paragraphs that are not in the cache, it obtains hypotheses by invoking the underlying translator's batch translation. The method then reconstructs the translation for each input text by sequentially combining the paragraph-level hypotheses. The combination is performed by concatenating the translation segments and aggregating their scores. Finally, it updates the cache with the newly translated paragraphs.
+        
+        Parameters:
+            input_texts (list[str]): A list of texts to be translated, where each text may consist of multiple paragraphs.
+            num_hypotheses (int, optional): The number of translation hypotheses to generate for each input text (default is 4).
+        
+        Returns:
+            list[list[Hypothesis]]: A list where each element is a list of Hypothesis objects representing the combined translation candidates for the corresponding input text.
+        """
+        new_cache = dict()  # 'text': ['t1'...('tN')]
+
+        paragraphs_ls = [ITranslation.split_into_paragraphs(input_text) for input_text in input_texts]
+
+        translated_paragraphs_d = {}
+        paragraphs_to_translate = []
+        for paragraphs in paragraphs_ls:
+            for paragraph in paragraphs:
+                translated_paragraph = self.cache.get(paragraph)
+                if translated_paragraph:
+                    translated_paragraphs_d[paragraph] = translated_paragraph
+                else:
+                    translated_paragraphs_d[paragraph] = ""
+                    paragraphs_to_translate.append(paragraph)
+
+        translated_paragraphs_p = self.underlying.hypotheses_batch(
+                    paragraphs_to_translate, num_hypotheses
+                )
+        for o_paragraph, paragraph in zip(paragraphs_to_translate, translated_paragraphs_p):
+            translated_paragraphs_d[o_paragraph] = paragraph
+
+        translated_paragraphs_ls = []
+        for paragraphs in paragraphs_ls:
+            translated_paragraphs = []
+            for paragraph in paragraphs:
+                translated_paragraphs.append(translated_paragraphs_d[paragraph])
+                new_cache[paragraph] = translated_paragraph
+            translated_paragraphs_ls.append(translated_paragraphs)
+
+        self.cache = new_cache
+
+        # Construct hypotheses
+
+        hypotheses_to_return_ls = []
+
+        for translated_paragraphs in translated_paragraphs_ls:
+            hypotheses_to_return = [Hypothesis("", 0) for i in range(num_hypotheses)]
+            for i in range(num_hypotheses):
+                for j in range(len(translated_paragraphs)):
+                    if not translated_paragraphs[j]:
+                        continue
+                    value = ITranslation.combine_paragraphs(
+                        [hypotheses_to_return[i].value, translated_paragraphs[j][i].value]
+                    )
+                    score = (
+                        hypotheses_to_return[i].score + translated_paragraphs[j][i].score
+                    )
+                    hypotheses_to_return[i] = Hypothesis(value, score)
+                hypotheses_to_return[i].value = hypotheses_to_return[i].value.lstrip("\n")
+            hypotheses_to_return_ls.append(hypotheses_to_return)
+        return hypotheses_to_return_ls
 
 
 class RemoteTranslation(ITranslation):
@@ -414,8 +645,8 @@ def apply_packaged_translation(
     pkg: Package,
     input_text: str,
     translator: Translator,
-    sentencizer: sbd.ISentenceBoundaryDetectionModel,
     num_hypotheses: int = 4,
+    sentencizer: sbd.ISentenceBoundaryDetectionModel = SpacySentencizerSmall(),
 ) -> list[Hypothesis]:
     """Applies the translation in pkg to translate input_text.
 
@@ -423,20 +654,18 @@ def apply_packaged_translation(
         pkg: The package that provides the translation.
         input_text: The text to be translated.
         translator: The CTranslate2 Translator
-        sentencizer: The Sentence Boundary Detection package
         num_hypotheses: The number of hypotheses to generate
 
     Returns:
-        A list of Hypotheses objects for translated input_text.
+        A list of Hypothesis's for translating input_text
+
     """
 
     info("apply_packaged_translation", input_text)
 
-    #Sentence boundary detection
-    sentences = sentencizer.split_sentences(input_text)
-    info("sentences", sentences)
+    # Sentence boundary detection
     """
-    # Argos Translate 1.9 Sentence Boundary Detection (legacy)
+    # Argos Translate 1.9 Sentence Boundary Detection
     if pkg.type == "sbd":
         sentences = [input_text]
     elif settings.stanza_available:
@@ -475,6 +704,9 @@ def apply_packaged_translation(
             info(input_text[start_index:sbd_index])
             start_index = sbd_index
     """
+    sentences = sentencizer.split_sentences(input_text)
+
+    info("sentences", sentences)
 
     # Tokenization
     tokenized = [pkg.tokenizer.encode(sentence) for sentence in sentences]
@@ -545,8 +777,7 @@ def get_installed_languages() -> list[Language]:
 
     if settings.model_provider == settings.ModelProvider.OPENNMT:
         packages = package.get_installed_packages()
-        '''
-        # Legacy sbd package search (environment-dependant)
+
         # If stanza not available filter for sbd available
         if not settings.stanza_available:
             sbd_packages = list(filter(lambda x: x.type == "sbd", packages))
@@ -556,7 +787,7 @@ def get_installed_languages() -> list[Language]:
             packages = list(
                 filter(lambda x: x.from_code in sbd_available_codes, packages)
             )
-        '''
+
         # Filter for translate packages
         packages = list(filter(lambda x: x.type == "translate", packages))
 
@@ -696,16 +927,27 @@ def get_translation_from_codes(from_code: str, to_code: str) -> ITranslation:
     return from_lang.get_translation(to_lang)
 
 
-def translate(q: str, from_code: str, to_code: str) -> str:
-    """Translate a string of text
-
-    Args:
-        q: The text to translate
-        from_code: The ISO 639 code of the source language
-        to_code: The ISO 639 code of the target language
-
+def translate(q: str | List[str], from_code: str, to_code: str) -> str:
+    """
+    Translate text from one language to another.
+    
+    This function translates input text from the source language specified by `from_code` to the target language specified by `to_code`. The input text can be provided as a single string or as a list of strings. When a single string is provided, the translation is performed using the single translation method; when a list is provided, a batch translation method is used.
+    
+    Parameters:
+        q (str or List[str]): The text to translate. Can be a single string or a list of strings.
+        from_code (str): The ISO 639 code of the source language.
+        to_code (str): The ISO 639 code of the target language.
+    
     Returns:
-        The translated text
+        str or List[str]: The translated text if a single string is provided, or a list of translated texts if a list of strings is provided.
+    
+    Raises:
+        TypeError: If `q` is neither a string nor a list of strings.
     """
     translation = get_translation_from_codes(from_code, to_code)
-    return translation.translate(q)
+    if isinstance(q, str):
+        return translation.translate(q)
+    elif isinstance(q, list):
+        return translation.translate_batch(q)
+    else:
+        raise TypeError("Input must be a string or a list of strings")
