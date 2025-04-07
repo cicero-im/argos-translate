@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import random
 import urllib.request
 
 from spacy.cli import download as spacy_download
@@ -9,6 +7,7 @@ from os import makedirs
 from pathlib import Path
 from argostranslate.utils import error, info
 from argostranslate import settings
+import secrets
 
 USER_AGENT = "ArgosTranslate"
 
@@ -76,7 +75,7 @@ def get_from(urls: list[str], retry_count: int = 3) -> bytes | None:
     Returns:
         The downloaded data, None is returned if the download fails
     """
-    for url in random.sample(urls, len(urls)):
+    for url in secrets.SystemRandom().sample(urls, len(urls)):
         attempt = get(url, retry_count)
         if attempt is not None:
             return attempt
